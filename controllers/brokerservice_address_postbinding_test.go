@@ -1033,6 +1033,15 @@ var _ = Describe("broker-service address post-binding validation", func() {
 			By("cleaning up")
 			Expect(k8sClient.Delete(ctx, &app2)).Should(Succeed())
 			Expect(k8sClient.Delete(ctx, &app1)).Should(Succeed())
+
+			By("waiting on server to quesce/drain before whacking certs")
+			Eventually(func(g Gomega) {
+				updatedService := &broker.BrokerService{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: defaultNamespace}, updatedService)).Should(Succeed())
+
+				g.Expect(len(updatedService.Status.ProvisionedApps)).Should(Equal(0))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
 			Expect(k8sClient.Delete(ctx, &service)).Should(Succeed())
 			UninstallCert(app2CertName, defaultNamespace)
 			UninstallCert(app1CertName, defaultNamespace)

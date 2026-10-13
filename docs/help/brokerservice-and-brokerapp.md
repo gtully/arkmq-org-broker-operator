@@ -59,7 +59,7 @@ The BrokerService reports four conditions:
 | `AppsProvisioned` | All bound BrokerApps have been configured on the broker |
 | `Ready` | The service is fully operational |
 
-The status also lists `provisionedApps` (apps successfully configured) and `rejectedApps` (apps that failed validation, with reasons).
+The status also lists `provisionedApps` (apps successfully configured on the broker).
 
 ## BrokerApp
 

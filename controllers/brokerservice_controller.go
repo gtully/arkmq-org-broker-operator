@@ -20,11 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/monitoring"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"path"
 	"reflect"
 	"sort"
+
+	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/monitoring"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+
 	"strings"
 
 	broker "github.com/arkmq-org/arkmq-org-broker-operator/v2/api/v1beta2"
@@ -35,14 +37,15 @@ import (
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/resources/networkpolicies"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/resources/secrets"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/templates"
+	mgmt "github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/artemis"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/common"
+	jolokia_client "github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/jolokia_client"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/selectors"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -50,9 +53,12 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+const BrokerServiceDrainFinalizer = "broker.arkmq.org/service-drain"
 
 type BrokerServiceReconciler struct {
 	*ReconcilerLoop
@@ -60,8 +66,9 @@ type BrokerServiceReconciler struct {
 
 type BrokerServiceInstanceReconciler struct {
 	*BrokerServiceReconciler
-	instance *broker.BrokerService
-	status   *broker.BrokerServiceStatus
+	instance     *broker.BrokerService
+	status       *broker.BrokerServiceStatus
+	drainingApps map[string]bool
 }
 
 func NewBrokerServiceReconciler(client client.Client, scheme *runtime.Scheme, config *rest.Config, logger logr.Logger) *BrokerServiceReconciler {
@@ -75,21 +82,45 @@ func NewBrokerServiceReconciler(client client.Client, scheme *runtime.Scheme, co
 //+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerservices,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerservices/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=monitoring.coreos.com,namespace=arkmq-org-broker-operator,resources=servicemonitors,verbs=get;list;watch;create;update;delete
-//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerapps,verbs=get;list;watch
-//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerapps/status,verbs=get;list;watch
+//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerservices/finalizers,verbs=update
+//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerapps,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerapps/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=broker.arkmq.org,namespace=arkmq-org-broker-operator,resources=brokerapps/finalizers,verbs=update
 
 func (reconciler *BrokerServiceReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	reqLogger := reconciler.log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "Reconciling", "BrokerService")
 
 	instance := &broker.BrokerService{}
-	var err = reconciler.Client.Get(context.TODO(), request.NamespacedName, instance)
+	var err = reconciler.Get(context.TODO(), request.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Clean up metrics when service is deleted
 			servicemetrics.DeleteServiceMetrics(request.Name, request.Namespace)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	if instance.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(instance, BrokerServiceDrainFinalizer) {
+		apps := &broker.BrokerAppList{}
+		svcKey := instance.Namespace + ":" + instance.Name
+		if listErr := reconciler.List(ctx, apps, client.MatchingFields{common.AppServiceBindingField: svcKey}); listErr != nil {
+			return ctrl.Result{}, listErr
+		}
+		hasDraining := false
+		for i := range apps.Items {
+			if controllerutil.ContainsFinalizer(&apps.Items[i], BrokerAppDrainFinalizer) {
+				hasDraining = true
+				break
+			}
+		}
+		if !hasDraining {
+			controllerutil.RemoveFinalizer(instance, BrokerServiceDrainFinalizer)
+			if updateErr := reconciler.Update(ctx, instance); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			servicemetrics.DeleteServiceMetrics(request.Name, request.Namespace)
+			return ctrl.Result{}, nil
+		}
 	}
 
 	localLoop := &ReconcilerLoop{
@@ -311,34 +342,57 @@ func (reconciler *BrokerServiceInstanceReconciler) processAppSecrets() (appPorts
 	// find all apps that select this service
 	apps := &broker.BrokerAppList{}
 	key := reconciler.instance.Namespace + ":" + reconciler.instance.Name
-	if err = reconciler.Client.List(context.TODO(), apps, client.MatchingFields{common.AppServiceBindingField: key}); err != nil {
+	if err = reconciler.List(context.TODO(), apps, client.MatchingFields{common.AppServiceBindingField: key}); err != nil {
 		return nil, err
 	}
 
-	// reset data
+	// deal with brokerService finalizer
+	hasContentApps := false
+	for i := range apps.Items {
+		if hasOwnedContent(&apps.Items[i]) {
+			hasContentApps = true
+			break
+		}
+	}
+	if hasContentApps && controllerutil.AddFinalizer(reconciler.instance, BrokerServiceDrainFinalizer) {
+		if updateErr := reconciler.Update(context.TODO(), reconciler.instance); updateErr != nil {
+			return nil, fmt.Errorf("failed to add drain finalizer to service %s: %v", reconciler.instance.Name, updateErr)
+		}
+	} else if !hasContentApps && reconciler.instance.DeletionTimestamp == nil &&
+		controllerutil.RemoveFinalizer(reconciler.instance, BrokerServiceDrainFinalizer) {
+		if updateErr := reconciler.Update(context.TODO(), reconciler.instance); updateErr != nil {
+			return nil, fmt.Errorf("failed to remove drain finalizer from service %s: %v", reconciler.instance.Name, updateErr)
+		}
+	}
+
+	// snapshot old data before reset — used to detect removed addresses for drain
+	oldData := desired.Data
 	desired.Data = make(map[string][]byte)
 	appIdentities := make([]string, 0, len(apps.Items))
-	rejectedApps := make([]broker.RejectedApp, 0)
 	validApps := make([]broker.BrokerApp, 0, len(apps.Items))
+	reconciler.status.Draining = nil
 
 	for _, app := range apps.Items {
-		valid, rejectionReason := reconciler.validateAppForProvisioning(&app, key)
-		if !valid {
-			// App failed validation - track it for user visibility
-			rejectedApps = append(rejectedApps, broker.RejectedApp{
-				Name:      app.Name,
-				Namespace: app.Namespace,
-				Reason:    rejectionReason,
-			})
-			continue
-		}
-
-		// Validate app name for safe file path construction
 		if err = common.ValidateResourceName(app.Name); err != nil {
 			reconciler.log.Error(err, "invalid app name", "app", app.Name)
 			break
 		}
-		if err = reconciler.processCapabilities(desired, &app); err != nil {
+		var tracker *AddressTracker
+		tracker, err = reconciler.buildAddressTracker(&app)
+		if err != nil {
+			reconciler.log.Error(err, "failed to build address tracker for app", "app", app.Name)
+			break
+		}
+		var skip bool
+		skip, err = reconciler.processDrain(&app, tracker, oldData)
+		if err != nil {
+			reconciler.log.Error(err, "failed to process drain for app", "app", app.Name)
+			break
+		}
+		if skip {
+			continue
+		}
+		if err = reconciler.processCapabilities(desired, &app, tracker); err != nil {
 			reconciler.log.Error(err, "failed to process capabilities for app", "app", app.Name)
 			break
 		}
@@ -358,9 +412,6 @@ func (reconciler *BrokerServiceInstanceReconciler) processAppSecrets() (appPorts
 		desired.Annotations = make(map[string]string)
 	}
 	desired.Annotations[common.ProvisionedAppsAnnotation] = strings.Join(appIdentities, ",")
-
-	// Track rejected apps in status for user visibility
-	reconciler.status.RejectedApps = rejectedApps
 
 	reconciler.TrackDesired(desired)
 
@@ -425,9 +476,10 @@ func certSecretName(cr *broker.BrokerService) string {
 
 func (reconciler *BrokerServiceInstanceReconciler) setValidCondition(err error) {
 	condition := metav1.Condition{
-		Type:   broker.ValidConditionType,
-		Status: metav1.ConditionTrue,
-		Reason: broker.ValidConditionSuccessReason,
+		Type:               broker.ValidConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             broker.ValidConditionSuccessReason,
+		ObservedGeneration: reconciler.instance.Generation,
 	}
 
 	if validErr, ok := err.(*ValidationError); ok {
@@ -439,20 +491,47 @@ func (reconciler *BrokerServiceInstanceReconciler) setValidCondition(err error) 
 	meta.SetStatusCondition(&reconciler.status.Conditions, condition)
 }
 
+func (reconciler *BrokerServiceInstanceReconciler) setReadyCondition(generation int64) {
+	condition := metav1.Condition{
+		Type:               broker.ReadyConditionType,
+		Reason:             broker.ReadyConditionReason,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: generation,
+	}
+
+	ready := meta.IsStatusConditionTrue(reconciler.status.Conditions, broker.DeployedConditionType)
+	for _, c := range reconciler.status.Conditions {
+		if c.Type != broker.ReadyConditionType && c.Status == metav1.ConditionFalse {
+			ready = false
+		}
+	}
+	if !ready {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = broker.NotReadyConditionReason
+		condition.Message = common.NotReadyConditionMessage
+	}
+
+	meta.SetStatusCondition(&reconciler.status.Conditions, condition)
+}
+
 func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError error) (err error, retry bool) {
 	// Set Valid condition (always updated)
 	reconciler.setValidCondition(reconcilerError)
 
+	generation := reconciler.instance.Generation
+
 	var deployedCondition metav1.Condition = metav1.Condition{
-		Type:   broker.DeployedConditionType,
-		Status: metav1.ConditionFalse,
-		Reason: broker.DeployedConditionNotReadyReason,
+		Type:               broker.DeployedConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             broker.DeployedConditionNotReadyReason,
+		ObservedGeneration: generation,
 	}
 
 	var appsProvisionedCondition metav1.Condition = metav1.Condition{
-		Type:   broker.AppsProvisionedConditionType,
-		Status: metav1.ConditionFalse,
-		Reason: broker.AppsProvisionedConditionWaitingReason,
+		Type:               broker.AppsProvisionedConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             broker.AppsProvisionedConditionWaitingReason,
+		ObservedGeneration: generation,
 	}
 
 	if reconcilerError != nil {
@@ -461,10 +540,16 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 			deployedCondition.Status = metav1.ConditionFalse
 			deployedCondition.Reason = transErr.ConditionReason()
 			deployedCondition.Message = transErr.Error()
-		} else if validErr, ok := reconcilerError.(*ValidationError); ok {
-			deployedCondition.Status = metav1.ConditionFalse
-			deployedCondition.Reason = validErr.ConditionReason()
-			deployedCondition.Message = validErr.Error()
+		} else if _, ok := reconcilerError.(*ValidationError); ok {
+			existing := meta.FindStatusCondition(reconciler.status.Conditions, broker.DeployedConditionType)
+			if existing != nil {
+				deployedCondition = *existing
+			} else {
+				deployedCondition.Status = metav1.ConditionFalse
+				deployedCondition.Reason = broker.DeployedConditionValidationFailedReason
+				deployedCondition.Message = "Cannot deploy due to validation failure"
+				deployedCondition.ObservedGeneration = 0
+			}
 		} else {
 			// Generic error (API errors, update errors, etc.)
 			deployedCondition.Status = metav1.ConditionUnknown
@@ -502,7 +587,7 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 				if appliedSecretVersion != "" {
 					secret := &corev1.Secret{}
 					secretKey := types.NamespacedName{Name: appPropsSecretName, Namespace: reconciler.instance.Namespace}
-					if getErr := reconciler.Client.Get(context.TODO(), secretKey, secret); getErr == nil {
+					if getErr := reconciler.Get(context.TODO(), secretKey, secret); getErr == nil {
 						if secret.ResourceVersion == appliedSecretVersion {
 							appsProvisionedCondition.Status = metav1.ConditionTrue
 							appsProvisionedCondition.Reason = broker.AppsProvisionedConditionSyncedReason
@@ -528,7 +613,27 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 	meta.SetStatusCondition(&reconciler.status.Conditions, deployedCondition)
 	meta.SetStatusCondition(&reconciler.status.Conditions, appsProvisionedCondition)
 
-	common.SetReadyCondition(&reconciler.status.Conditions)
+	reconciler.setReadyCondition(generation)
+
+	if reconciler.instance.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(reconciler.instance, BrokerServiceDrainFinalizer) {
+		message := "Deletion pending, waiting for bound apps to drain"
+		if len(reconciler.status.Draining) > 0 {
+			drainingApps := make([]string, 0, len(reconciler.status.Draining))
+			for _, ds := range reconciler.status.Draining {
+				drainingApps = append(drainingApps, ds.App)
+			}
+			message = fmt.Sprintf("Deletion pending, draining apps: %s", strings.Join(drainingApps, ", "))
+		}
+		meta.SetStatusCondition(&reconciler.status.Conditions, metav1.Condition{
+			Type:               broker.ReadyConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             broker.ReadyConditionDrainingBeforeDeletion,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+	}
+
+	reconciler.status.ObservedGeneration = generation
 
 	if !reflect.DeepEqual(reconciler.instance.Status, *reconciler.status) {
 		reconciler.instance.Status = *reconciler.status
@@ -540,6 +645,10 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 		reconciler.instance.Namespace,
 		len(reconciler.status.ProvisionedApps),
 	)
+
+	if len(reconciler.status.Draining) > 0 {
+		retry = true
+	}
 
 	return err, retry
 }
@@ -562,51 +671,9 @@ func getBindingValue(service *broker.BrokerServiceBindingStatus) string {
 	return service.Key()
 }
 
-// appMatchesSelector validates that an app matches this service's appSelectorExpression.
-// This is a security check to prevent apps from bypassing access control by manually
-// setting the status.serviceBinding field.
-func (reconciler *BrokerServiceInstanceReconciler) appMatchesSelector(app *broker.BrokerApp) bool {
-	matches, err := appselector.Matches(app, reconciler.instance, reconciler.Client)
-	if err != nil {
-		return false
-	}
-	return matches
-}
-
-// validateAppForProvisioning performs all security checks to ensure an app is authorized
-// to be provisioned by this service.
-// Returns (valid, reason):
-//   - (true, "") if app should be provisioned
-//   - (false, reason) if app fails validation and should be rejected
-func (reconciler *BrokerServiceInstanceReconciler) validateAppForProvisioning(app *broker.BrokerApp, serviceKey string) (bool, string) {
-	// App's label selector matches service labels
-	if app.Spec.ServiceSelector != nil {
-		selector, err := metav1.LabelSelectorAsSelector(app.Spec.ServiceSelector)
-		if err != nil {
-			reconciler.log.Error(err, "Rejecting app with invalid label selector",
-				"app", appName(app))
-			return false, "invalid label selector"
-		}
-		if !selector.Matches(labels.Set(reconciler.instance.Labels)) {
-			reconciler.log.Info("Rejecting app that does not match service labels (status.serviceBinding manually set?)",
-				"app", appName(app),
-				"service", serviceName(reconciler.instance),
-				"appSelector", app.Spec.ServiceSelector,
-				"serviceLabels", reconciler.instance.Labels)
-			return false, "does not match service labels"
-		}
-	}
-
-	// App matches CEL selector expression
-	if !reconciler.appMatchesSelector(app) {
-		reconciler.log.Info("Rejecting app that does not match appSelectorExpression (status.serviceBinding manually set?)",
-			"app", appName(app),
-			"service", serviceName(reconciler.instance),
-			"expression", reconciler.instance.Spec.AppSelectorExpression)
-		return false, "does not match appSelectorExpression"
-	}
-
-	return true, ""
+func isAppUnbinding(app *broker.BrokerApp) bool {
+	deployedCond := meta.FindStatusCondition(app.Status.Conditions, broker.DeployedConditionType)
+	return deployedCond != nil && deployedCond.Reason == broker.DeployedConditionUnbindingReason
 }
 
 func (reconciler *BrokerServiceInstanceReconciler) processService() error {
@@ -815,62 +882,54 @@ func (t *AddressTracker) trackAddressType(addrType *broker.AddressType) *Address
 	return addressConfig
 }
 
-func (reconciler *BrokerServiceInstanceReconciler) processCapabilities(secret *corev1.Secret, app *broker.BrokerApp) (err error) {
+// buildAddressTracker creates an AddressTracker populated from the app's current
+// spec. For deleting or departing apps the tracker is left empty so that
+// detectDrainingAddresses treats all previously-deployed addresses as removed.
+func (reconciler *BrokerServiceInstanceReconciler) buildAddressTracker(app *broker.BrokerApp) (*AddressTracker, error) {
 	addressTracker := newAddressTracker()
 
 	role := AppIdentity(app)
 
-	// First, track addresses declared in spec.addresses (private, owned by this app)
-	// This ensures addressConfigurations are generated even if the app has no capabilities
+	if app.DeletionTimestamp != nil || isAppUnbinding(app) {
+		return addressTracker, nil
+	}
+
 	for _, addrType := range app.Spec.Addresses {
 		addressTracker.trackAddressType(&addrType)
 	}
 
-	// Also track addresses declared in spec.sharedAddresses (public, owned by this app)
 	for _, addrType := range app.Spec.SharedAddresses {
 		addressTracker.trackAddressType(&addrType)
 	}
 
-	// Then, process capabilities to find inline addresses and capture roles
 	for _, capability := range app.Spec.Capabilities {
 
 		var entry *AddressConfig
 
-		// Process ProducerOf
 		for _, addressRef := range capability.ProducerOf {
 			entry = addressTracker.track(&addressRef)
 			entry.senderRoles[role] = role
 
-			// Handle pub/sub declaration (can be explicit via pubSub:true or inferred from subscriptions)
 			if isMulticastAddress(addressRef.PubSub, addressRef.Subscriptions) {
-				// pubSub=true (explicit) or has subscriptions means "this is a MULTICAST address"
-				// Validation already ensures subscriptions is empty (no queue names allowed for producers)
 				entry.isMulticast = true
 			}
 		}
 
-		// Process ConsumerOf
 		for _, addressRef := range capability.ConsumerOf {
 			entry = addressTracker.track(&addressRef)
 
 			if !isMulticastAddress(addressRef.PubSub, addressRef.Subscriptions) {
-				// ANYCAST - direct queue consumption (no pubSub, no subscriptions)
 				entry.consumerRoles[role] = role
 
-				// Validate idempotency: check if address was already marked as MULTICAST
 				if entry.isOwned && entry.isMulticast {
-					return fmt.Errorf(
+					return nil, fmt.Errorf(
 						"address '%s' is referenced with both pubSub and non pubSub semantics. "+
 							"This creates a conflict. Use consistent semantics for the same address",
 						addressRef.Address)
 				}
 			} else {
-				// MULTICAST - multicast queue-based consumption (pubSub=true or has subscriptions)
-				// Validation already ensures len > 0 (empty subscriptions not allowed for consumers)
-
-				// Validate idempotency: check if address was already used with ANYCAST
 				if entry.isOwned && len(entry.consumerRoles) > 0 && !entry.isMulticast {
-					return fmt.Errorf(
+					return nil, fmt.Errorf(
 						"address '%s' is referenced with both pubSub and non pubSub semantics. "+
 							"This creates a conflict. Use consistent semantics for the same address",
 						addressRef.Address)
@@ -878,7 +937,6 @@ func (reconciler *BrokerServiceInstanceReconciler) processCapabilities(secret *c
 
 				entry.isMulticast = true
 
-				// Generate FQQN for each multicast queue
 				for _, queueName := range addressRef.Subscriptions {
 					fqqn := addressRef.Address + FQQNSeparator + queueName
 					queueEntry := addressTracker.track(&broker.AddressRef{
@@ -893,6 +951,85 @@ func (reconciler *BrokerServiceInstanceReconciler) processCapabilities(secret *c
 		}
 	}
 
+	return addressTracker, nil
+}
+
+// processDrain handles the drain lifecycle for a single app: adding/removing
+// the drain finalizer. It mutates the tracker to include any draining addresses that
+// still have pending messages. Returns skip=true when the app is drain-complete
+// and the caller should not generate config for it.
+func (reconciler *BrokerServiceInstanceReconciler) processDrain(app *broker.BrokerApp, tracker *AddressTracker, oldSecretData map[string][]byte) (skip bool, err error) {
+	role := AppIdentity(app)
+
+	if app.DeletionTimestamp == nil && hasOwnedContent(app) && controllerutil.AddFinalizer(app, BrokerAppDrainFinalizer) {
+		if updateErr := reconciler.Update(context.TODO(), app); updateErr != nil {
+			return false, fmt.Errorf("failed to add drain finalizer to app %s: %v", app.Name, updateErr)
+		}
+	}
+
+	if drainingAddresses := reconciler.detectDrainingAddresses(app, tracker, oldSecretData); len(drainingAddresses) > 0 {
+		for _, da := range drainingAddresses {
+			addrType := broker.AddressType{
+				Address:       da.Address,
+				Subscriptions: da.Subscriptions,
+			}
+			tracker.trackAddressType(&addrType)
+			if len(da.Subscriptions) == 0 && da.HadConsumeRole {
+				entry := tracker.names[da.Address]
+				entry.consumerRoles[role] = role
+			}
+			for _, subName := range da.Subscriptions {
+				fqqn := da.Address + FQQNSeparator + subName
+				if qe, exists := tracker.names[fqqn]; exists {
+					qe.subscriberRoles[role] = role
+				}
+			}
+		}
+		if reconciler.drainingApps == nil {
+			reconciler.drainingApps = make(map[string]bool)
+		}
+		reconciler.drainingApps[role] = true
+		appDrainStatus := broker.DrainingAddressStatus{
+			App:      role,
+			Messages: make(map[string]int64),
+		}
+		for _, da := range drainingAddresses {
+			for fqqn, count := range da.MessageCounts {
+				appDrainStatus.Messages[fqqn] = count
+			}
+		}
+		reconciler.status.Draining = append(reconciler.status.Draining, appDrainStatus)
+		return false, nil
+	}
+
+	// deletion and all drained — remove finalizer so deletion is not blocked
+	if app.DeletionTimestamp != nil {
+		if controllerutil.RemoveFinalizer(app, BrokerAppDrainFinalizer) {
+			if updateErr := reconciler.Update(context.TODO(), app); updateErr != nil {
+				return false, fmt.Errorf("failed to remove drain finalizer from app %s: %v", app.Name, updateErr)
+			}
+		}
+		return true, nil
+	}
+
+	// live unbinding app, drain complete — remove finalizer so binding can be cleared
+	if isAppUnbinding(app) && controllerutil.RemoveFinalizer(app, BrokerAppDrainFinalizer) {
+		if updateErr := reconciler.Update(context.TODO(), app); updateErr != nil {
+			return false, fmt.Errorf("failed to remove drain finalizer from app %s: %v", app.Name, updateErr)
+		}
+	}
+
+	// live app no longer has owned content — clean up stale finalizer
+	if !hasOwnedContent(app) && controllerutil.RemoveFinalizer(app, BrokerAppDrainFinalizer) {
+		if updateErr := reconciler.Update(context.TODO(), app); updateErr != nil {
+			return false, fmt.Errorf("failed to remove drain finalizer from app %s: %v", app.Name, updateErr)
+		}
+	}
+
+	return false, nil
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) processCapabilities(secret *corev1.Secret, app *broker.BrokerApp, addressTracker *AddressTracker) (err error) {
 	cfg := &brokerproperties.CapabilitiesJSON{
 		AddressConfigurations: map[string]*brokerproperties.AddressConfiguration{},
 		SecurityRoles:         map[string]map[string]*brokerproperties.RolePermissions{},
@@ -1033,6 +1170,9 @@ func (reconciler *BrokerServiceInstanceReconciler) processAcceptor(serverConfigP
 			dedupMap[fmt.Sprintf("%s=%s\n", producerRole(namespacedName), namespacedName)] = ""
 		}
 	}
+	if reconciler.drainingApps[AppIdentity(app)] {
+		dedupMap[fmt.Sprintf("%s=%s\n", consumerRole(namespacedName), namespacedName)] = ""
+	}
 
 	rolesBuf := brokerproperties.NewPropsWithHeader()
 	for _, k := range brokerproperties.SortedKeys(dedupMap) {
@@ -1143,12 +1283,20 @@ func AppIdentity(app *broker.BrokerApp) string {
 	return NameSpacedValue(app, app.Name)
 }
 
+func AppIdentityPrefix(app *broker.BrokerApp) string {
+	return AppIdentity(app) + "@"
+}
+
 func AppIdentityWithGeneration(app *broker.BrokerApp) string {
-	return fmt.Sprintf("%s/%s@%d", app.Namespace, app.Name, app.Generation)
+	return fmt.Sprintf("%s%d", AppIdentityPrefix(app), app.Generation)
+}
+
+func FileAppIdentity(app *broker.BrokerApp) string {
+	return DashPrefixValue(app.Namespace, app.Name)
 }
 
 func AppIdentityPrefixed(app *broker.BrokerApp, v string) string {
-	return DashPrefixValue(AppIdentity(app), v)
+	return DashPrefixValue(FileAppIdentity(app), v)
 }
 
 func UnderscoreAppIdentityPrefixed(app *broker.BrokerApp, v string) string {
@@ -1156,11 +1304,15 @@ func UnderscoreAppIdentityPrefixed(app *broker.BrokerApp, v string) string {
 }
 
 func NameSpacedValue(app *broker.BrokerApp, v string) string {
-	return DashPrefixValue(app.Namespace, v)
+	return SlashPrefixValue(app.Namespace, v)
 }
 
 func DashPrefixValue(prefix, value string) string {
 	return fmt.Sprintf("%s-%s", prefix, value)
+}
+
+func SlashPrefixValue(prefix, value string) string {
+	return fmt.Sprintf("%s/%s", prefix, value)
 }
 
 func (reconciler *BrokerServiceInstanceReconciler) controlPlaneOverrideSecretName() string {
@@ -1271,6 +1423,184 @@ func (reconciler *BrokerServiceInstanceReconciler) appCertCN(app *broker.BrokerA
 	}
 
 	return subject.CommonName, nil
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) wasAppEverProvisioned(app *broker.BrokerApp) bool {
+	prefix := AppIdentityPrefix(app)
+	for _, pa := range reconciler.status.ProvisionedApps {
+		if strings.HasPrefix(pa, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectDrainingAddresses compares the current spec addresses against the previously
+// deployed capabilities.json to find addresses that were removed. It checks Jolokia
+// to determine if removed addresses still have undrained messages. Returns only addresses
+// that still need draining.
+func (reconciler *BrokerServiceInstanceReconciler) detectDrainingAddresses(app *broker.BrokerApp, currentTracker *AddressTracker, oldSecretData map[string][]byte) []DrainingAddressInfo {
+	if !reconciler.wasAppEverProvisioned(app) {
+		return nil
+	}
+
+	capKey := AppIdentityPrefixed(app, "capabilities.json")
+	oldCapData, exists := oldSecretData[capKey]
+	if !exists || len(oldCapData) == 0 {
+		return nil
+	}
+
+	var oldCaps brokerproperties.CapabilitiesJSON
+	if err := json.Unmarshal(oldCapData, &oldCaps); err != nil {
+		reconciler.log.V(1).Info("Failed to unmarshal old capabilities, skipping drain detection",
+			"app", app.Name, "error", err)
+		return nil
+	}
+
+	if len(oldCaps.AddressConfigurations) == 0 {
+		return nil
+	}
+
+	// Build set of currently owned addresses (exclude FQQN entries from the
+	// tracker — those are per-queue entries derived from the address config)
+	currentOwned := make(map[string]bool)
+	for name, config := range currentTracker.names {
+		if config.isOwned && !strings.Contains(name, FQQNSeparator) {
+			currentOwned[name] = true
+		}
+	}
+
+	// Find addresses in old config that are no longer in current spec
+	appConsumerRole := consumerRole(AppIdentity(app))
+	var candidates []DrainingAddressInfo
+	for name, oldCfg := range oldCaps.AddressConfigurations {
+		if currentOwned[name] {
+			continue
+		}
+		dai := DrainingAddressInfo{Address: name}
+		if addrRoles, ok := oldCaps.SecurityRoles[name]; ok {
+			if perms, ok := addrRoles[appConsumerRole]; ok && perms.Consume {
+				dai.HadConsumeRole = true
+			}
+		}
+		// Extract subscription queue names from the old config
+		if oldCfg.RoutingTypes == brokerproperties.RoutingTypeMulticast && oldCfg.QueueConfigs != nil {
+			for queueName, qc := range oldCfg.QueueConfigs {
+				if qc.RoutingType == brokerproperties.RoutingTypeMulticast && queueName != name {
+					dai.Subscriptions = append(dai.Subscriptions, queueName)
+				}
+			}
+			sort.Strings(dai.Subscriptions)
+		}
+		candidates = append(candidates, dai)
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Check Jolokia for drain status
+	drainResults, err := reconciler.checkAddressDrainStatus(context.TODO(), candidates)
+	if err != nil {
+		reconciler.log.V(1).Info("Error checking address drain status, preserving all candidates",
+			"app", app.Name, "error", err)
+		return candidates
+	}
+
+	var undrained []DrainingAddressInfo
+	for _, candidate := range candidates {
+		if dr, checked := drainResults[candidate.Address]; checked && dr.drained {
+			reconciler.log.V(1).Info("Address drain complete", "app", app.Name, "address", candidate.Address)
+		} else {
+			reconciler.log.V(1).Info("Address drain in progress", "app", app.Name, "address", candidate.Address)
+			if checked {
+				candidate.MessageCounts = dr.messageCounts
+			}
+			undrained = append(undrained, candidate)
+		}
+	}
+	return undrained
+}
+
+type DrainingAddressInfo struct {
+	Address        string           `json:"address"`
+	Subscriptions  []string         `json:"subscriptions,omitempty"`
+	HadConsumeRole bool             `json:"-"`
+	MessageCounts  map[string]int64 `json:"-"`
+}
+
+type addressDrainResult struct {
+	drained       bool
+	messageCounts map[string]int64
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) checkAddressDrainStatus(ctx context.Context, addresses []DrainingAddressInfo) (map[string]addressDrainResult, error) {
+	brokerCR := &broker.Broker{}
+	brokerKey := types.NamespacedName{
+		Name:      reconciler.instance.Name,
+		Namespace: reconciler.instance.Namespace,
+	}
+	if err := reconciler.Get(ctx, brokerKey, brokerCR); err != nil {
+		return nil, fmt.Errorf("failed to get Broker CR for address drain check: %v", err)
+	}
+
+	jkInfos := jolokia_client.GetMinimalJolokiaAgentsForBroker(brokerCR, reconciler.Client)
+	if len(jkInfos) == 0 {
+		return nil, fmt.Errorf("no Jolokia agents found for broker %s", brokerKey.Name)
+	}
+
+	return evaluateAddressDrainStatus(reconciler.log, jkInfos[0].Artemis, addresses), nil
+}
+
+func evaluateAddressDrainStatus(reqLogger logr.Logger, artemis *mgmt.Artemis, addresses []DrainingAddressInfo) map[string]addressDrainResult {
+	queueCounts, err := artemis.GetAllQueueMessageCounts()
+	if err != nil {
+		reqLogger.V(1).Info("Pattern read for queue counts failed, marking all addresses as undrained", "error", err)
+	}
+
+	var queueCountMap map[string]int64
+	if len(queueCounts) > 0 {
+		queueCountMap = make(map[string]int64, len(queueCounts))
+		for _, qc := range queueCounts {
+			key := qc.Address + "::" + qc.Queue + "::" + qc.RoutingType
+			queueCountMap[key] = qc.Count
+		}
+	}
+
+	result := make(map[string]addressDrainResult, len(addresses))
+	for _, addr := range addresses {
+		dr := addressDrainResult{messageCounts: make(map[string]int64)}
+		if queueCountMap != nil {
+			dr.drained = true
+			if len(addr.Subscriptions) > 0 {
+				for _, sub := range addr.Subscriptions {
+					key := addr.Address + "::" + sub + "::multicast"
+					fqqn := addr.Address + "::" + sub
+					if count, found := queueCountMap[key]; found {
+						dr.messageCounts[fqqn] = count
+						if count > 0 {
+							dr.drained = false
+						}
+					}
+					// queue not found in map = queue no longer exists on the broker = drained
+				}
+			} else {
+				key := addr.Address + "::" + addr.Address + "::anycast"
+				if count, found := queueCountMap[key]; found {
+					dr.messageCounts[addr.Address] = count
+					if count > 0 {
+						dr.drained = false
+					}
+				}
+				// queue not found in map = queue no longer exists on the broker = drained
+			}
+		} else {
+			dr.drained = false
+		}
+		result[addr.Address] = dr
+		reqLogger.V(1).Info("Address drain status", "address", addr.Address, "drained", dr.drained)
+	}
+	return result
 }
 
 // queueOwners maps every queue the validated apps produce to or consume from to

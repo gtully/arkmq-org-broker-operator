@@ -162,5 +162,18 @@ func init() {
 }
 
 const (
-	ValidConditionServiceSelectorError = "ServiceSelectorError"
+	DeployedConditionNoMatchingServiceReason      = "NoMatchingService"
+	DeployedConditionNoServiceCapacityReason      = "NoServiceCapacity"
+	DeployedConditionMatchedServiceNotFoundReason = "MatchedServiceNotFound"
+	DeployedConditionBindingReason                = "Binding"
+	DeployedConditionBoundReason                  = "Bound"
+	DeployedConditionSelectorEvaluationError      = "AppSelectorEvaluationError"
+	DeployedConditionMissingAppCertReason         = "MissingAppCert"
+	DeployedConditionUnbindingReason              = "Unbinding"
+
+	ValidConditionServiceSelectorError    = "ServiceSelectorError"
+	ValidConditionSharedAddressInUseError = "SharedAddressInUse"
+	ValidConditionAddressTypeError        = "AddressTypeError"
+
+	ReadyConditionUnbindingReason = "Unbinding"
 )
